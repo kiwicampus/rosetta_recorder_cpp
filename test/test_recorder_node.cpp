@@ -655,9 +655,11 @@ TEST_F(RecorderNodeTest, DeleteLastBagRemovesTheBagThenReportsNoBag)
 
 TEST_F(RecorderNodeTest, CancelRecordingServiceTerminatesTheGoalAsCanceled)
 {
-  // This is the behaviour data_capture keys off: a SUCCEEDED result means "hit
-  // max duration, unintended stop" and the bag gets discarded, so a stop
-  // requested through the service has to come back CANCELED.
+  // A stop somebody asked for must be distinguishable from one the recorder
+  // arrived at on its own, because that is how a consumer decides whether the
+  // episode is worth keeping: SUCCEEDED means it ran out its max duration.
+  // ~/cancel_recording therefore forwards to the action's own cancel service, so
+  // this path reports CANCELED rather than a lookalike clean finish.
   make_node();
   make_helper();
   configure_and_activate();
@@ -720,8 +722,8 @@ TEST_F(RecorderNodeTest, ActionCancelTerminatesTheGoalAsCanceled)
 
 TEST_F(RecorderNodeTest, MaxDurationStopTerminatesTheGoalAsSucceeded)
 {
-  // The mirror of the test above: an unintended max-duration stop must stay
-  // SUCCEEDED, because that is how data_capture recognises it.
+  // The mirror of the test above: running out the clock is the recorder's own
+  // defined end, not something a client took away, so it stays SUCCEEDED.
   make_node({rclcpp::Parameter("default_max_duration", 1.0)});
   make_helper();
   configure_and_activate();

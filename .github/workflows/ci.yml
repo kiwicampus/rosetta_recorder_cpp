@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: src/episode_recorder_cpp
+          path: src/rosetta_recorder_cpp
 
       # rosetta_interfaces supplies the RecordEpisode action and the
       # StartRecording service; it is not in the ROS index.
@@ -53,6 +53,6 @@ jobs:
           source install/setup.bash
           # Keep the test graph off any real robot on the default domain.
           export ROS_DOMAIN_ID=93
-          colcon test --packages-select episode_recorder_cpp \
+          colcon test --packages-select rosetta_recorder_cpp \
             --event-handlers console_direct+
           colcon test-result --verbose

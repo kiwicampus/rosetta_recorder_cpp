@@ -701,9 +701,9 @@ TEST_F(RecorderNodeTest, CancelRecordingServiceTerminatesTheGoalAsCanceled)
 {
   // A stop somebody asked for must be distinguishable from one the recorder
   // arrived at on its own, because that is how a consumer decides whether the
-  // episode is worth keeping: SUCCEEDED means it ran out its max duration.
-  // ~/cancel_recording therefore forwards to the action's own cancel service, so
-  // this path reports CANCELED rather than a lookalike clean finish.
+  // episode is worth keeping. ~/cancel_recording forwards to the action's own
+  // cancel service precisely so this path can report `cancelled`/CANCELED
+  // rather than a lookalike clean finish.
   make_node();
   make_helper();
   configure_and_activate();
@@ -770,8 +770,8 @@ TEST_F(RecorderNodeTest, ActionCancelTerminatesTheGoalAsCanceled)
 
 TEST_F(RecorderNodeTest, MaxDurationStopTerminatesTheGoalAsSucceeded)
 {
-  // The mirror of the test above: running out the clock is the recorder's own
-  // defined end, not something a client took away, so it stays SUCCEEDED.
+  // The mirror of the test above: running out the clock is a defined end, not
+  // something a client took away, so it stays `timeout`/SUCCEEDED.
   make_node({rclcpp::Parameter("default_max_duration_s", 1.0)});
   make_helper();
   configure_and_activate();

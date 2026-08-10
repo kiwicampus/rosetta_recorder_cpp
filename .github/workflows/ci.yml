@@ -27,10 +27,17 @@ jobs:
 
       # rosetta_interfaces supplies the RecordEpisode action and the
       # StartRecording service; it is not in the ROS index.
+      #
+      # Pinned, not floating on the default branch: upstream has since
+      # redesigned RecordEpisode (Result.success -> termination_reason,
+      # Feedback.seconds_remaining -> elapsed_s). This is the revision the
+      # deployment pins and the one this recorder is written against, so
+      # tracking HEAD would break the build on an unrelated push.
       - name: Fetch rosetta_interfaces
         uses: actions/checkout@v4
         with:
           repository: iblnkn/rosetta_interfaces
+          ref: 90e979108b9b8cdbe791697ee9a338192e16e9fc
           path: src/rosetta_interfaces
 
       - name: Install dependencies

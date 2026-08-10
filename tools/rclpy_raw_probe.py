@@ -49,12 +49,40 @@ from contract_topics import topics_from_contract
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 
+# rosbag2 gave TopicMetadata a leading `id` field in Jazzy and made
+# offered_qos_profiles a list of QoS objects rather than a YAML string. Resolved
+# from ROS_DISTRO, the same split CMakeLists.txt resolves for the C++ node.
+_PRE_JAZZY_DISTROS = ("foxy", "galactic", "humble", "iron")
+_TOPIC_METADATA_HAS_ID = (
+    os.environ.get("ROS_DISTRO", "humble") not in _PRE_JAZZY_DISTROS
+)
+
 
 def read_cpu_seconds() -> float:
     """utime + stime of this process, in seconds."""
     with open("/proc/self/stat") as f:
         fields = f.read().split()
     return (int(fields[13]) + int(fields[14])) / CLK_TCK
+
+
+def make_topic_metadata(rosbag2_py, topic_id: int, topic: str, type_str: str):
+    """Build a TopicMetadata for whichever rosbag2 this distro ships.
+
+    Minimal metadata either way: this bag is a stopwatch, not an artifact, so
+    no QoS profiles are recorded.
+
+    Args:
+        rosbag2_py: The imported rosbag2_py module.
+        topic_id: Index of this topic, used as the Jazzy-and-newer ``id``.
+        topic: Topic name.
+        type_str: Message type, e.g. ``std_msgs/msg/String``.
+
+    Returns:
+        A rosbag2_py.TopicMetadata ready for create_topic().
+    """
+    if _TOPIC_METADATA_HAS_ID:
+        return rosbag2_py.TopicMetadata(topic_id, topic, type_str, "cdr")
+    return rosbag2_py.TopicMetadata(topic, type_str, "cdr", "")
 
 
 class ProbeNode(Node):
@@ -88,10 +116,9 @@ class ProbeNode(Node):
                     input_serialization_format="cdr", output_serialization_format="cdr"
                 ),
             )
-            for _section, topic, type_str, _qos in topics:
-                # Minimal metadata: this bag is a stopwatch, not an artifact.
+            for topic_id, (_section, topic, type_str, _qos) in enumerate(topics):
                 self._writer.create_topic(
-                    rosbag2_py.TopicMetadata(topic, type_str, "cdr", "")
+                    make_topic_metadata(rosbag2_py, topic_id, topic, type_str)
                 )
             self.bag_path = bag_path
 

@@ -26,6 +26,8 @@ Changes made relative to the original (Apache-2.0 §4(b)):
   * The contract loader implements only the subset a recorder needs
     (topic, type, QoS, buffering strategy). It does not validate LeRobot
     dtypes, image resize, or decoder/encoder import paths.
+  * The contract text is embedded in bag metadata verbatim; the original also
+    records a hash of it alongside, which this package does not.
   * Bag directory naming is selectable via the `bag_name_style` parameter. It
     defaults to the original <epoch_sec>_<nsec>; `datetime` selects
     YYYYMMDD-HHMMSS-mmm instead. A -<n> suffix guards a same-name collision in

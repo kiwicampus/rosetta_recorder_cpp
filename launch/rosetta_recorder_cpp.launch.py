@@ -51,7 +51,7 @@ def generate_launch_description():
                 "contract_path": LaunchConfiguration("contract_path"),
                 "bag_base_dir": LaunchConfiguration("bag_base_dir"),
                 "storage_id": LaunchConfiguration("storage_id"),
-                "default_max_duration": LaunchConfiguration("default_max_duration"),
+                "default_max_duration_s": LaunchConfiguration("default_max_duration_s"),
                 "feedback_rate_hz": LaunchConfiguration("feedback_rate_hz"),
                 "record_all": LaunchConfiguration("record_all"),
                 "bag_name_style": LaunchConfiguration("bag_name_style"),
@@ -76,7 +76,7 @@ def generate_launch_description():
                 description="rosbag2 storage plugin (mcap, sqlite3)",
             ),
             DeclareLaunchArgument(
-                "default_max_duration",
+                "default_max_duration_s",
                 default_value="600.0",
                 description="Auto-stop an episode after this many seconds",
             ),

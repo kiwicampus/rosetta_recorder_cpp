@@ -25,13 +25,16 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "lifecycle_msgs/msg/state.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -82,6 +85,13 @@ bool is_datetime_name(const std::string & name)
 {
   static const std::regex re(R"(^\d{8}-\d{6}-\d{3}$)");
   return std::regex_match(name, re);
+}
+
+/// Canonical 8-4-4-4-12 hex UUID, the form bag metadata records a goal id in.
+bool is_uuid(const std::string & s)
+{
+  static const std::regex re(R"(^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$)");
+  return std::regex_match(s, re);
 }
 
 /// Poll a predicate until it holds or the deadline passes.
@@ -145,7 +155,7 @@ protected:
       rclcpp::Parameter("contract_path", contract_path_.string()),
       rclcpp::Parameter("bag_base_dir", bag_base_.string()),
       rclcpp::Parameter("storage_id", std::string("mcap")),
-      rclcpp::Parameter("default_max_duration", 60.0),
+      rclcpp::Parameter("default_max_duration_s", 60.0),
       // Fast ticks: the tick is what observes a stop request and closes the bag.
       rclcpp::Parameter("feedback_rate_hz", 20.0),
     };
@@ -232,6 +242,40 @@ protected:
 
     call<Trigger>("/episode_recorder/cancel_recording", std::make_shared<Trigger::Request>());
     return name;
+  }
+
+  /// Wait for a finalized bag and return its rosbag2_bagfile_information node.
+  /// Returns a null node if none appears, so callers can ASSERT_TRUE on it.
+  YAML::Node wait_for_bag_info(std::chrono::milliseconds timeout = 10s)
+  {
+    fs::path meta;
+    const bool found = wait_for(
+      [&] {
+        if (!fs::exists(bag_base_)) {
+          return false;
+        }
+        for (const auto & e : fs::directory_iterator(bag_base_)) {
+          if (fs::exists(e.path() / "metadata.yaml")) {
+            meta = e.path() / "metadata.yaml";
+            return true;
+          }
+        }
+        return false;
+      }, timeout);
+    if (!found) {
+      return YAML::Node();
+    }
+    return YAML::LoadFile(meta.string())["rosbag2_bagfile_information"];
+  }
+
+  /// The finalized bag's custom_data, or a null node if it never appeared.
+  YAML::Node wait_for_custom_data(std::chrono::milliseconds timeout = 10s)
+  {
+    const YAML::Node info = wait_for_bag_info(timeout);
+    if (!info) {
+      return YAML::Node();
+    }
+    return info["custom_data"];
   }
 
   template<typename SrvT>
@@ -687,7 +731,9 @@ TEST_F(RecorderNodeTest, CancelRecordingServiceTerminatesTheGoalAsCanceled)
   ASSERT_EQ(result_future.wait_for(15s), std::future_status::ready);
   const auto result = result_future.get();
   EXPECT_EQ(result.code, rclcpp_action::ResultCode::CANCELED);
-  EXPECT_FALSE(result.result->success);
+  EXPECT_EQ(
+    result.result->termination_reason,
+    RecordEpisode::Result::TERMINATION_CANCELLED);
   EXPECT_FALSE(result.result->bag_path.empty());
 }
 
@@ -717,14 +763,16 @@ TEST_F(RecorderNodeTest, ActionCancelTerminatesTheGoalAsCanceled)
   ASSERT_EQ(result_future.wait_for(15s), std::future_status::ready);
   const auto result = result_future.get();
   EXPECT_EQ(result.code, rclcpp_action::ResultCode::CANCELED);
-  EXPECT_FALSE(result.result->success);
+  EXPECT_EQ(
+    result.result->termination_reason,
+    RecordEpisode::Result::TERMINATION_CANCELLED);
 }
 
 TEST_F(RecorderNodeTest, MaxDurationStopTerminatesTheGoalAsSucceeded)
 {
   // The mirror of the test above: running out the clock is the recorder's own
   // defined end, not something a client took away, so it stays SUCCEEDED.
-  make_node({rclcpp::Parameter("default_max_duration", 1.0)});
+  make_node({rclcpp::Parameter("default_max_duration_s", 1.0)});
   make_helper();
   configure_and_activate();
   start_spin();
@@ -743,7 +791,9 @@ TEST_F(RecorderNodeTest, MaxDurationStopTerminatesTheGoalAsSucceeded)
   ASSERT_EQ(result_future.wait_for(20s), std::future_status::ready);
   const auto result = result_future.get();
   EXPECT_EQ(result.code, rclcpp_action::ResultCode::SUCCEEDED);
-  EXPECT_TRUE(result.result->success);
+  EXPECT_EQ(
+    result.result->termination_reason,
+    RecordEpisode::Result::TERMINATION_TIMEOUT);
   EXPECT_FALSE(result.result->bag_path.empty());
 }
 
@@ -770,4 +820,258 @@ TEST_F(RecorderNodeTest, SecondGoalIsRejectedWhileRecording)
 
   client->async_cancel_goal(first);
   std::this_thread::sleep_for(500ms);
+}
+
+// ---------------------------------------------------------------------------
+// Goal-level max_duration_s, feedback, and the prompt default
+// ---------------------------------------------------------------------------
+
+TEST_F(RecorderNodeTest, GoalMaxDurationOverridesTheParameter)
+{
+  // The parameter is generous; the goal asks for one second. If the goal field
+  // were ignored the result would not arrive inside the wait below.
+  make_node({rclcpp::Parameter("default_max_duration_s", 600.0)});
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  auto client = rclcpp_action::create_client<RecordEpisode>(helper_, "/record_episode");
+  ASSERT_TRUE(client->wait_for_action_server(10s));
+
+  RecordEpisode::Goal goal;
+  goal.prompt = "short one";
+  goal.max_duration_s = 1.0;
+
+  auto goal_future = client->async_send_goal(goal);
+  ASSERT_EQ(goal_future.wait_for(10s), std::future_status::ready);
+  auto handle = goal_future.get();
+  ASSERT_NE(handle, nullptr);
+
+  auto result_future = client->async_get_result(handle);
+  ASSERT_EQ(result_future.wait_for(20s), std::future_status::ready) <<
+    "goal max_duration_s was ignored; still waiting on the 600s parameter";
+  const auto result = result_future.get();
+  EXPECT_EQ(result.code, rclcpp_action::ResultCode::SUCCEEDED);
+  EXPECT_EQ(
+    result.result->termination_reason,
+    RecordEpisode::Result::TERMINATION_TIMEOUT);
+}
+
+TEST_F(RecorderNodeTest, ZeroGoalMaxDurationFallsBackToTheParameter)
+{
+  // 0.0 is the action's "use the node default" value, not "stop immediately".
+  make_node({rclcpp::Parameter("default_max_duration_s", 1.0)});
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  auto client = rclcpp_action::create_client<RecordEpisode>(helper_, "/record_episode");
+  ASSERT_TRUE(client->wait_for_action_server(10s));
+
+  RecordEpisode::Goal goal;
+  goal.prompt = "default duration";
+  goal.max_duration_s = 0.0;
+
+  const auto sent = std::chrono::steady_clock::now();
+  auto goal_future = client->async_send_goal(goal);
+  ASSERT_EQ(goal_future.wait_for(10s), std::future_status::ready);
+  auto handle = goal_future.get();
+  ASSERT_NE(handle, nullptr);
+
+  auto result_future = client->async_get_result(handle);
+  ASSERT_EQ(result_future.wait_for(20s), std::future_status::ready);
+  const auto lasted = std::chrono::steady_clock::now() - sent;
+  const auto result = result_future.get();
+  EXPECT_EQ(
+    result.result->termination_reason,
+    RecordEpisode::Result::TERMINATION_TIMEOUT);
+  // The reason alone cannot tell the two readings of 0.0 apart — both end in a
+  // timeout. Only the duration can: taken literally it would stop on the first
+  // tick, so anything near the 1s parameter proves the fallback happened.
+  EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(lasted).count(), 700) <<
+    "0.0 was taken literally instead of falling back to default_max_duration_s";
+}
+
+TEST_F(RecorderNodeTest, FeedbackReportsElapsedSeconds)
+{
+  make_node({rclcpp::Parameter("feedback_rate_hz", 20.0)});
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  auto client = rclcpp_action::create_client<RecordEpisode>(helper_, "/record_episode");
+  ASSERT_TRUE(client->wait_for_action_server(10s));
+
+  std::vector<double> elapsed;
+  std::mutex fb_mutex;
+  auto opts = rclcpp_action::Client<RecordEpisode>::SendGoalOptions();
+  opts.feedback_callback =
+    [&](rclcpp_action::ClientGoalHandle<RecordEpisode>::SharedPtr,
+      const std::shared_ptr<const RecordEpisode::Feedback> fb) {
+      std::lock_guard<std::mutex> lk(fb_mutex);
+      elapsed.push_back(fb->elapsed_s);
+    };
+
+  RecordEpisode::Goal goal;
+  goal.prompt = "watch the clock";
+  auto goal_future = client->async_send_goal(goal, opts);
+  ASSERT_EQ(goal_future.wait_for(10s), std::future_status::ready);
+  auto handle = goal_future.get();
+  ASSERT_NE(handle, nullptr);
+
+  ASSERT_TRUE(
+    wait_for(
+      [&] {
+        std::lock_guard<std::mutex> lk(fb_mutex);
+        return elapsed.size() >= 3;
+      }, 10s)) << "no feedback arrived";
+
+  client->async_cancel_goal(handle);
+  std::this_thread::sleep_for(500ms);
+
+  std::lock_guard<std::mutex> lk(fb_mutex);
+  // Counting up from zero, not down from a limit: this is the field that
+  // replaced seconds_remaining, so the direction is the point.
+  EXPECT_GE(elapsed.front(), 0.0);
+  EXPECT_GT(elapsed.back(), elapsed.front()) << "elapsed_s did not advance";
+}
+
+TEST_F(RecorderNodeTest, DefaultPromptIsUsedWhenTheRequestLeavesItEmpty)
+{
+  make_node({rclcpp::Parameter("default_prompt", std::string("fallback prompt"))});
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  auto req = std::make_shared<StartRecording::Request>();
+  req->prompt = "";
+  auto started = call<StartRecording>("/episode_recorder/start_recording", req);
+  ASSERT_NE(started, nullptr);
+  ASSERT_TRUE(started->accepted) << started->message;
+
+  std::this_thread::sleep_for(300ms);
+  call<Trigger>("/episode_recorder/cancel_recording", std::make_shared<Trigger::Request>());
+
+  const YAML::Node custom = wait_for_custom_data();
+  ASSERT_TRUE(custom) << "no finalized bag with custom_data appeared";
+  EXPECT_EQ(custom["lerobot.operator_prompt"].as<std::string>(), "fallback prompt");
+}
+
+// ---------------------------------------------------------------------------
+// Provenance in bag metadata
+// ---------------------------------------------------------------------------
+
+TEST_F(RecorderNodeTest, MetadataCarriesTheContractTextAndGoalId)
+{
+  make_node();
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  auto client = rclcpp_action::create_client<RecordEpisode>(helper_, "/record_episode");
+  ASSERT_TRUE(client->wait_for_action_server(10s));
+
+  RecordEpisode::Goal goal;
+  goal.prompt = "provenance";
+  goal.max_duration_s = 1.0;
+  auto goal_future = client->async_send_goal(goal);
+  ASSERT_EQ(goal_future.wait_for(10s), std::future_status::ready);
+  auto handle = goal_future.get();
+  ASSERT_NE(handle, nullptr);
+
+  auto result_future = client->async_get_result(handle);
+  ASSERT_EQ(result_future.wait_for(20s), std::future_status::ready);
+
+  const YAML::Node custom = wait_for_custom_data();
+  ASSERT_TRUE(custom) << "no finalized bag with custom_data appeared";
+
+  // The contract file verbatim, so a bag can be replayed against what produced it.
+  ASSERT_TRUE(custom["rosetta.contract_yaml"]) << YAML::Dump(custom);
+  const std::string embedded = custom["rosetta.contract_yaml"].as<std::string>();
+  EXPECT_NE(embedded.find("robot_type: test_bot"), std::string::npos) << embedded;
+  EXPECT_NE(embedded.find("/test_erc/a"), std::string::npos) << embedded;
+
+  // Canonical 8-4-4-4-12 UUID of the goal that produced the bag.
+  ASSERT_TRUE(custom["rosetta.goal_id"]) << YAML::Dump(custom);
+  const std::string goal_id = custom["rosetta.goal_id"].as<std::string>();
+  EXPECT_TRUE(is_uuid(goal_id)) << goal_id;
+}
+
+TEST_F(RecorderNodeTest, EmbedContractDisabledOmitsTheContractText)
+{
+  make_node({rclcpp::Parameter("embed_contract", false)});
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  auto req = std::make_shared<StartRecording::Request>();
+  req->prompt = "no contract please";
+  auto started = call<StartRecording>("/episode_recorder/start_recording", req);
+  ASSERT_NE(started, nullptr);
+  ASSERT_TRUE(started->accepted) << started->message;
+
+  std::this_thread::sleep_for(300ms);
+  call<Trigger>("/episode_recorder/cancel_recording", std::make_shared<Trigger::Request>());
+
+  const YAML::Node custom = wait_for_custom_data();
+  ASSERT_TRUE(custom) << "no finalized bag with custom_data appeared";
+  EXPECT_TRUE(custom["lerobot.operator_prompt"]) << YAML::Dump(custom);
+  EXPECT_FALSE(custom["rosetta.contract_yaml"]) << YAML::Dump(custom);
+  // A service-started episode has no goal, so there is no id to record.
+  EXPECT_FALSE(custom["rosetta.goal_id"]) << YAML::Dump(custom);
+}
+
+// ---------------------------------------------------------------------------
+// include_topics
+// ---------------------------------------------------------------------------
+
+TEST_F(RecorderNodeTest, IncludeTopicsOverridesExcludeTopics)
+{
+  // A broad exclude stays in place and is punched through for one topic, rather
+  // than being rewritten to enumerate everything that should survive it.
+  make_node(
+  {
+    rclcpp::Parameter("record_all", true),
+    rclcpp::Parameter("exclude_topics", std::vector<std::string>{"/probe_.*"}),
+    rclcpp::Parameter("include_topics", std::vector<std::string>{"/probe_keep"}),
+  });
+  make_helper();
+  configure_and_activate();
+  start_spin();
+
+  // Both match the exclude; only one is forced back in.
+  auto keep = helper_->create_publisher<std_msgs::msg::String>("/probe_keep", rclcpp::QoS(10));
+  auto drop = helper_->create_publisher<std_msgs::msg::String>("/probe_drop", rclcpp::QoS(10));
+  ASSERT_TRUE(
+    wait_for([&] {return keep->get_subscription_count() >= 0;}, 2s));
+  std::this_thread::sleep_for(500ms);
+
+  auto req = std::make_shared<StartRecording::Request>();
+  req->prompt = "include test";
+  auto started = call<StartRecording>("/episode_recorder/start_recording", req);
+  ASSERT_NE(started, nullptr);
+  ASSERT_TRUE(started->accepted) << started->message;
+
+  for (int i = 0; i < 5; ++i) {
+    std_msgs::msg::String msg;
+    msg.data = "x";
+    keep->publish(msg);
+    drop->publish(msg);
+    std::this_thread::sleep_for(20ms);
+  }
+  std::this_thread::sleep_for(300ms);
+  call<Trigger>("/episode_recorder/cancel_recording", std::make_shared<Trigger::Request>());
+
+  const YAML::Node info = wait_for_bag_info();
+  ASSERT_TRUE(info) << "no finalized bag appeared";
+
+  std::vector<std::string> recorded;
+  for (const auto & entry : info["topics_with_message_count"]) {
+    recorded.push_back(entry["topic_metadata"]["name"].as<std::string>());
+  }
+  const auto has = [&](const std::string & t) {
+      return std::find(recorded.begin(), recorded.end(), t) != recorded.end();
+    };
+  EXPECT_TRUE(has("/probe_keep")) << "include_topics did not override exclude_topics";
+  EXPECT_FALSE(has("/probe_drop")) << "exclude_topics stopped applying";
 }

@@ -1,0 +1,58 @@
+# Build and test on every distro this package claims to support.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: humble
+            image: ubuntu-22.04
+          - distro: jazzy
+            image: ubuntu-24.04
+    container:
+      image: ros:${{ matrix.distro }}-ros-base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/episode_recorder_cpp
+
+      # rosetta_interfaces supplies the RecordEpisode action and the
+      # StartRecording service; it is not in the ROS index.
+      - name: Fetch rosetta_interfaces
+        uses: actions/checkout@v4
+        with:
+          repository: iblnkn/rosetta_interfaces
+          path: src/rosetta_interfaces
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update --rosdistro ${{ matrix.distro }}
+          rosdep install --from-paths src --ignore-src -y \
+            --rosdistro ${{ matrix.distro }}
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+
+      - name: Test
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          source install/setup.bash
+          # Keep the test graph off any real robot on the default domain.
+          export ROS_DOMAIN_ID=93
+          colcon test --packages-select episode_recorder_cpp \
+            --event-handlers console_direct+
+          colcon test-result --verbose

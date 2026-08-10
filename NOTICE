@@ -1,0 +1,34 @@
+rosetta_recorder_cpp
+Copyright 2026 Robot.com
+
+This product includes software developed as part of rosetta
+(https://github.com/iblnkn/rosetta), Copyright 2025 Isaac Blankenau,
+licensed under the Apache License, Version 2.0.
+
+Specifically, this package is a C++ port of rosetta's
+`rosetta/episode_recorder_node.py`. It reproduces that node's external
+interface — node name, RecordEpisode action, ~/start_recording,
+~/cancel_recording and ~/delete_last_bag services, lifecycle behaviour,
+parameters, bag layout and bag metadata — and reads the same contract YAML
+files.
+
+Changes made relative to the original (Apache-2.0 §4(b)):
+
+  * Rewritten from Python (rclpy) to C++ (rclcpp).
+  * Subscriptions are generic: messages are carried as serialized CDR from the
+    wire to the bag, rather than deserialized into message objects and then
+    re-serialized before writing.
+  * Runs on a single-threaded executor; bag writes happen on a dedicated writer
+    thread fed by a bounded queue, and the episode is driven by a timer rather
+    than by a sleeping loop on a worker thread.
+  * Duplicate contract topics are dropped with a warning instead of producing
+    two subscriptions.
+  * The contract loader implements only the subset a recorder needs
+    (topic, type, QoS, buffering strategy). It does not validate LeRobot
+    dtypes, image resize, or decoder/encoder import paths.
+  * Bag directory naming is selectable via the `bag_name_style` parameter. It
+    defaults to the original <epoch_sec>_<nsec>; `datetime` selects
+    YYYYMMDD-HHMMSS-mmm instead. A -<n> suffix guards a same-name collision in
+    both styles, which the original does not do.
+
+The Apache License, Version 2.0 applies to this package in full; see LICENSE.

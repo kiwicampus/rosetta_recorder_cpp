@@ -72,6 +72,8 @@ namespace rosetta_recorder_cpp
 constexpr const char * kBagMetadataKey = "rosbag2_bagfile_information";
 constexpr const char * kBagCustomDataKey = "custom_data";
 constexpr const char * kBagPromptKey = "lerobot.operator_prompt";
+constexpr const char * kBagContractKey = "rosetta.contract_yaml";
+constexpr const char * kBagGoalIdKey = "rosetta.goal_id";
 
 /// metadata.yaml is written by rosbag2 when the bag closes; retry while we wait
 /// for it to appear.
@@ -159,7 +161,10 @@ private:
 
   // -------------------- Recording --------------------
   /// Common entry point for both the action and the service.
-  bool start_recording(const std::string & prompt, std::string & error_out);
+  /// \param max_duration_s Auto-stop after this long; <= 0.0 selects the
+  ///   default_max_duration_s parameter, which is all a service call can ask for.
+  bool start_recording(
+    const std::string & prompt, double max_duration_s, std::string & error_out);
   /// Recreate `resubscribe_on_start` subscriptions (and, under record_all,
   /// discover topics). Returns how many subscriptions were recreated; a nonzero
   /// count means the episode start is deferred by kResubscribeSettleDelay.
@@ -168,13 +173,29 @@ private:
   /// received, open the bag, and go live.
   void complete_start();
   /// Drop a start that is still waiting on its settle timer.
-  void cancel_pending_start(const std::string & reason);
+  void cancel_pending_start(
+    const std::string & termination_reason, const std::string & detail);
   /// Open the bag and arm the feedback timer. \throws on storage failure.
   void begin_episode();
   /// Timer tick: publishes feedback, enforces max duration, honors cancel.
   void on_recording_tick();
   /// Close the bag, stamp metadata, settle the action goal.
-  void finish_recording(const std::string & reason, bool canceled);
+  ///
+  /// \param termination_reason One of RecordEpisode::Result's TERMINATION_*
+  ///   constants. It decides the goal's terminal state; see settle_goal().
+  /// \param detail Human-readable context for Result.message. Left empty on the
+  ///   paths that have nothing to add beyond the reason.
+  void finish_recording(const std::string & termination_reason, const std::string & detail = "");
+  /// Give the live goal its terminal state from result->termination_reason and
+  /// send `result`. Clears goal_handle_. No-op when the episode had no goal.
+  ///
+  /// Legality first, then meaning, the same order rosetta's finish_goal() uses:
+  /// canceled() is legal only from CANCELING, so that check wins; succeed() and
+  /// abort() are legal from both, so a cancel racing in cannot make the
+  /// transition illegal.
+  void settle_goal(const std::shared_ptr<RecordEpisode::Result> & result);
+  /// Format an action goal id as a canonical UUID string for bag metadata.
+  static std::string format_goal_id(const rclcpp_action::GoalUUID & uuid);
   /// Ask our own action server to cancel the live goal, so it terminates as
   /// CANCELED rather than SUCCEEDED. Returns false when there is nothing to
   /// cancel or the cancel service is unavailable, in which case the caller must
@@ -184,8 +205,12 @@ private:
   std::filesystem::path create_bag_dir();
   void open_writer(const std::filesystem::path & bag_dir);
   void close_writer();
-  /// \throws std::runtime_error when the prompt cannot be persisted.
-  void write_metadata(const std::filesystem::path & bag_dir, const std::string & prompt);
+  /// Stamp the bag's metadata.yaml custom_data with the prompt, and with the
+  /// contract text and goal id when those are available.
+  /// \throws std::runtime_error when the entries cannot be persisted.
+  void write_metadata(
+    const std::filesystem::path & bag_dir, const std::string & prompt,
+    const std::string & contract_text, const std::string & goal_id);
 
   // -------------------- Writer thread --------------------
   void writer_thread_main();
@@ -222,11 +247,21 @@ private:
   std::optional<Contract> contract_;
   std::filesystem::path bag_base_;
   std::string storage_id_;
-  double default_max_duration_{300.0};
+  double default_max_duration_s_{300.0};
   double feedback_rate_hz_{2.0};
   bool record_all_{false};
   BagNameStyle bag_name_style_{BagNameStyle::kEpoch};
   std::optional<std::regex> exclude_regex_;
+  /// Topics matching this always auto-record, even when exclude_regex_ matches
+  /// them. Unset when include_topics is empty.
+  std::optional<std::regex> include_regex_;
+  /// Prompt used when a goal or service call leaves it empty.
+  std::string default_prompt_;
+  /// Copy the contract's own text into every bag's metadata.
+  bool embed_contract_{true};
+  /// The contract file verbatim, read at configure. Empty when embed_contract_
+  /// is false, so nothing is held that will not be written.
+  std::string contract_text_;
 
   // -------------------- Topics --------------------
   /// Stable indices; subscription callbacks capture an index into this vector,
@@ -255,6 +290,9 @@ private:
   std::filesystem::path current_bag_dir_;
   std::filesystem::path last_bag_dir_;
   std::string current_prompt_;
+  /// UUID of the goal that started this episode, formatted for metadata. Empty
+  /// for a service-started recording, which has no goal.
+  std::string current_goal_id_;
   rclcpp::Time recording_start_;
   double current_max_duration_{300.0};
 

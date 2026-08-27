@@ -138,11 +138,26 @@ ros2 service call /episode_recorder/cancel_recording std_srvs/srv/Trigger
 ros2 service call /episode_recorder/delete_last_bag std_srvs/srv/Trigger
 ```
 
-An episode ends **SUCCEEDED** when it runs to `default_max_duration`, and
-**CANCELED** when it is stopped by the action's cancel, or by
-`~/cancel_recording`. Consumers use that distinction to tell an intended stop
-from an unintended one, so it is part of the interface, not an implementation
-detail.
+### How an episode ends
+
+`Result.termination_reason` says exactly why, and the goal's terminal state says
+which category that falls into. Consumers use the distinction to tell an intended
+stop from an unintended one, so it is part of the interface, not an
+implementation detail.
+
+| `termination_reason` | Goal state | Cause |
+|---|---|---|
+| `timeout` | SUCCEEDED | ran to `max_duration_s` |
+| `stopped` | SUCCEEDED | stopped at a defined end |
+| `cancelled` | CANCELED | the action's cancel, or `~/cancel_recording` |
+| `node_deactivated` | ABORTED | lifecycle transition took the recording away |
+| `error` | ABORTED | bag or metadata failure |
+
+`cancelled` is treated as an abort reason if the goal somehow never reached
+CANCELING — succeeding there would report a clean finish for work somebody asked
+to stop. `bag_path` is populated on every path, failures included.
+
+`Feedback` reports `elapsed_s` counting up, plus `messages_written`.
 
 ## Parameters
 
@@ -152,10 +167,23 @@ detail.
 | `bag_base_dir` | `/workspaces/rosetta_ws/datasets/bags` | Where bags are written. Read-only. |
 | `storage_id` | `mcap` | rosbag2 storage plugin. Read-only. |
 | `exclude_topics` | `[""]` | Regexes excluded from `record_all`, same syntax as `ros2 bag record --exclude`. Read-only. |
+| `include_topics` | `[""]` | Regexes always auto-recorded, overriding `exclude_topics`. Read-only. |
 | `record_all` | `false` | Also record non-contract topics found on the graph. Read-only. |
+| `embed_contract` | `true` | Copy the contract YAML text into each bag's `custom_data`. Read-only. |
 | `bag_name_style` | `epoch` | Bag directory naming. `epoch` is rosetta's `<epoch_sec>_<nsec>`; `datetime` is `YYYYMMDD-HHMMSS-mmm` in local time. Any other value fails `configure`. Read-only. |
-| `default_max_duration` | `300.0` | Seconds before an episode auto-stops. |
+| `default_max_duration_s` | `300.0` | Seconds before an episode auto-stops. Used only when the goal leaves `max_duration_s` at `0.0`. |
+| `default_prompt` | `""` | Prompt used when a goal or service call leaves `prompt` empty. |
 | `feedback_rate_hz` | `2.0` | Action feedback rate; also how often a stop request is noticed. |
+
+## What it writes into bag metadata
+
+Under `rosbag2_bagfile_information.custom_data`:
+
+| Key | |
+|---|---|
+| `lerobot.operator_prompt` | The episode's prompt. |
+| `rosetta.contract_yaml` | The contract file verbatim, when `embed_contract` is set. |
+| `rosetta.goal_id` | UUID of the goal that produced the bag. Absent for a service-started episode, which has no goal. |
 
 ## What it reads from a contract
 

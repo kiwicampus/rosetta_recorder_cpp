@@ -106,7 +106,23 @@ void EpisodeRecorderNode::declare_parameters()
       "Regex patterns for topics to exclude from auto-recording "
       "(same syntax as ros2 bag record --exclude)", true));
   declare_parameter(
-    "default_max_duration", 300.0, describe("Maximum recording duration in seconds"));
+    "include_topics", std::vector<std::string>{""},
+    describe(
+      "Regex patterns for topics to always auto-record, overriding "
+      "exclude_topics", true));
+  declare_parameter(
+    "default_prompt", std::string(""),
+    describe("Prompt used when a goal or service call leaves prompt empty"));
+  declare_parameter(
+    "embed_contract", true,
+    describe(
+      "Copy the contract YAML text into every bag's metadata.yaml custom_data",
+      true));
+  declare_parameter(
+    "default_max_duration_s", 300.0,
+    describe(
+      "Maximum recording duration in seconds. Used only when the goal does not "
+      "set max_duration_s"));
   declare_parameter(
     "feedback_rate_hz", 2.0, describe("Rate for publishing action feedback"));
   declare_parameter(
@@ -161,12 +177,30 @@ EpisodeRecorderNode::on_configure(const rclcpp_lifecycle::State &)
     }
 
     storage_id_ = get_parameter("storage_id").as_string();
-    default_max_duration_ = get_parameter("default_max_duration").as_double();
+    default_max_duration_s_ = get_parameter("default_max_duration_s").as_double();
     feedback_rate_hz_ = get_parameter("feedback_rate_hz").as_double();
     if (feedback_rate_hz_ <= 0.0) {
       feedback_rate_hz_ = 2.0;
     }
     record_all_ = get_parameter("record_all").as_bool();
+    default_prompt_ = get_parameter("default_prompt").as_string();
+    embed_contract_ = get_parameter("embed_contract").as_bool();
+
+    // Read the contract as text too, so every bag can carry the exact file that
+    // produced it — comments included — rather than a re-serialized summary.
+    contract_text_.clear();
+    if (embed_contract_) {
+      std::ifstream cf(contract_path);
+      if (cf) {
+        std::ostringstream buf;
+        buf << cf.rdbuf();
+        contract_text_ = buf.str();
+      } else {
+        RCLCPP_WARN(
+          get_logger(), "Cannot re-read %s as text; bags will omit %s",
+          contract_path.c_str(), kBagContractKey);
+      }
+    }
 
     try {
       bag_name_style_ = parse_bag_name_style(get_parameter("bag_name_style").as_string());
@@ -197,6 +231,26 @@ EpisodeRecorderNode::on_configure(const rclcpp_lifecycle::State &)
     } catch (const std::regex_error & e) {
       RCLCPP_ERROR(get_logger(), "Invalid exclude_topics regex: %s", e.what());
       return CallbackReturn::FAILURE;
+    }
+
+    // include_topics wins over exclude_topics, so a broad exclude can be kept
+    // and punched through for one topic rather than rewritten.
+    include_regex_.reset();
+    std::string included;
+    const rclcpp::Parameter include_param = get_parameter("include_topics");
+    for (const auto & p : include_param.as_string_array()) {
+      if (!p.empty()) {
+        included += (included.empty() ? "" : "|");
+        included += p;
+      }
+    }
+    if (!included.empty()) {
+      try {
+        include_regex_ = std::regex(included, std::regex::ECMAScript);
+      } catch (const std::regex_error & e) {
+        RCLCPP_ERROR(get_logger(), "Invalid include_topics regex: %s", e.what());
+        return CallbackReturn::FAILURE;
+      }
     }
 
     build_topic_list();
@@ -271,10 +325,12 @@ EpisodeRecorderNode::on_deactivate(const rclcpp_lifecycle::State & state)
 {
   accepting_goals_.store(false);
 
-  cancel_pending_start("Stopped: node deactivated before recording started");
+  cancel_pending_start(
+    RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED,
+    "Stopped: node deactivated before recording started");
   if (is_recording_.load()) {
     RCLCPP_INFO(get_logger(), "Stopping in-progress recording...");
-    finish_recording("Stopped: node deactivated", false);
+    finish_recording(RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED, "node deactivated");
   }
 
   RCLCPP_INFO(get_logger(), "Deactivated");
@@ -285,9 +341,11 @@ EpisodeRecorderNode::CallbackReturn
 EpisodeRecorderNode::on_cleanup(const rclcpp_lifecycle::State &)
 {
   accepting_goals_.store(false);
-  cancel_pending_start("Stopped: node cleanup before recording started");
+  cancel_pending_start(
+    RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED,
+    "Stopped: node cleanup before recording started");
   if (is_recording_.load()) {
-    finish_recording("Stopped: node cleanup", false);
+    finish_recording(RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED, "node cleanup");
   }
 
   // The drain thread outlives a single episode, so cleanup — not just shutdown —
@@ -324,9 +382,11 @@ EpisodeRecorderNode::CallbackReturn
 EpisodeRecorderNode::on_shutdown(const rclcpp_lifecycle::State &)
 {
   accepting_goals_.store(false);
-  cancel_pending_start("Stopped: node shutdown before recording started");
+  cancel_pending_start(
+    RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED,
+    "Stopped: node shutdown before recording started");
   if (is_recording_.load()) {
-    finish_recording("Stopped: node shutdown", false);
+    finish_recording(RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED, "node shutdown");
   }
   stop_writer_thread();
 
@@ -348,9 +408,10 @@ EpisodeRecorderNode::on_error(const rclcpp_lifecycle::State & state)
   RCLCPP_ERROR(get_logger(), "Error occurred in state: %s", state.label().c_str());
   accepting_goals_.store(false);
   try {
-    cancel_pending_start("Stopped: node error before recording started");
+    cancel_pending_start(
+      RecordEpisode::Result::TERMINATION_ERROR, "Stopped: node error before recording started");
     if (is_recording_.load()) {
-      finish_recording("Stopped: node error", false);
+      finish_recording(RecordEpisode::Result::TERMINATION_ERROR, "node error");
     }
     close_writer();
   } catch (const std::exception & e) {
@@ -427,7 +488,8 @@ void EpisodeRecorderNode::discover_topics()
       if (types.empty()) {
         continue;
       }
-      if (exclude_regex_ && std::regex_search(name, *exclude_regex_)) {
+      const bool forced = include_regex_ && std::regex_search(name, *include_regex_);
+      if (!forced && exclude_regex_ && std::regex_search(name, *exclude_regex_)) {
         continue;
       }
 
@@ -831,7 +893,8 @@ void EpisodeRecorderNode::begin_episode()
     std::bind(&EpisodeRecorderNode::on_recording_tick, this), services_cbg_);
 }
 
-bool EpisodeRecorderNode::start_recording(const std::string & prompt, std::string & error_out)
+bool EpisodeRecorderNode::start_recording(
+  const std::string & prompt, double max_duration_s, std::string & error_out)
 {
   std::lock_guard<std::mutex> lk(lifecycle_mutex_);
 
@@ -853,8 +916,10 @@ bool EpisodeRecorderNode::start_recording(const std::string & prompt, std::strin
   }
   messages_written_.store(0);
   messages_dropped_.store(0);
-  current_prompt_ = prompt;
-  current_max_duration_ = default_max_duration_;
+  current_prompt_ = prompt.empty() ? default_prompt_ : prompt;
+  // A goal that leaves max_duration_s at 0.0 is asking for the node default,
+  // which is also the only thing a service-started episode can ask for.
+  current_max_duration_ = max_duration_s > 0.0 ? max_duration_s : default_max_duration_s_;
   current_bag_dir_ = create_bag_dir();
 
   RCLCPP_INFO(
@@ -933,17 +998,17 @@ void EpisodeRecorderNode::complete_start()
     // the result rather than the accept/reject response.
     if (goal_handle_) {
       auto result = std::make_shared<RecordEpisode::Result>();
-      result->success = false;
+      result->termination_reason = RecordEpisode::Result::TERMINATION_ERROR;
       result->message = err;
       result->bag_path = "";
       result->messages_written = 0;
-      goal_handle_->abort(result);
-      goal_handle_.reset();
+      settle_goal(result);
     }
   }
 }
 
-void EpisodeRecorderNode::cancel_pending_start(const std::string & reason)
+void EpisodeRecorderNode::cancel_pending_start(
+  const std::string & termination_reason, const std::string & detail)
 {
   if (!start_pending_.exchange(false)) {
     return;
@@ -953,17 +1018,17 @@ void EpisodeRecorderNode::cancel_pending_start(const std::string & reason)
     pending_start_timer_.reset();
   }
   pending_resubscribed_.clear();
-  RCLCPP_WARN(get_logger(), "%s", reason.c_str());
+  RCLCPP_WARN(get_logger(), "%s", detail.c_str());
 
   if (goal_handle_) {
     auto result = std::make_shared<RecordEpisode::Result>();
-    result->success = false;
-    result->message = reason;
+    result->termination_reason = termination_reason;
+    result->message = detail;
     result->bag_path = "";
     result->messages_written = 0;
-    goal_handle_->abort(result);
-    goal_handle_.reset();
+    settle_goal(result);
   }
+  current_goal_id_.clear();
 }
 
 void EpisodeRecorderNode::on_recording_tick()
@@ -981,46 +1046,91 @@ void EpisodeRecorderNode::on_recording_tick()
       std::lock_guard<std::mutex> el(write_error_mutex_);
       err = write_error_;
     }
-    finish_recording(err.empty() ? "Write failed" : err, false);
+    finish_recording(
+      RecordEpisode::Result::TERMINATION_ERROR, err.empty() ? "Write failed" : err);
     return;
   }
 
   if (stop_requested_.load()) {
-    // An action-level cancel puts the goal in CANCELING and terminates as
-    // CANCELED. A stop via ~/cancel_recording cannot reach that state — only
-    // the action's own cancel service can — so it terminates as SUCCEEDED with
-    // the reason recorded in the message. The bag is complete either way.
+    // ~/cancel_recording forwards to the action's own cancel service, so a stop
+    // that came from there arrives here already in CANCELING and is reported as
+    // cancelled. Anything else that sets stop_requested_ is a plain stop.
     const bool canceled = goal_handle_ && goal_handle_->is_canceling();
     std::string reason;
     {
       std::lock_guard<std::mutex> el(write_error_mutex_);
-      reason = stop_reason_.empty() ? "Stopped" : stop_reason_;
+      reason = stop_reason_;
     }
-    finish_recording(canceled ? "Cancelled" : reason, canceled);
+    finish_recording(
+      canceled ? RecordEpisode::Result::TERMINATION_CANCELLED
+               : RecordEpisode::Result::TERMINATION_STOPPED, reason);
     return;
   }
 
   if (goal_handle_ && goal_handle_->is_canceling()) {
-    finish_recording("Cancelled", true);
+    finish_recording(RecordEpisode::Result::TERMINATION_CANCELLED);
     return;
   }
 
   if (remaining <= 0.0) {
     RCLCPP_INFO(get_logger(), "Timeout reached");
-    finish_recording("Timeout reached", false);
+    finish_recording(RecordEpisode::Result::TERMINATION_TIMEOUT);
     return;
   }
 
   if (goal_handle_) {
     auto fb = std::make_shared<RecordEpisode::Feedback>();
-    fb->seconds_remaining = static_cast<int32_t>(remaining);
+    fb->elapsed_s = elapsed;
     fb->messages_written = static_cast<int32_t>(messages_written_.load());
-    fb->status = "recording";
     goal_handle_->publish_feedback(fb);
   }
 }
 
-void EpisodeRecorderNode::finish_recording(const std::string & reason, bool canceled)
+std::string EpisodeRecorderNode::format_goal_id(const rclcpp_action::GoalUUID & uuid)
+{
+  // 8-4-4-4-12 hex, the same shape Python's uuid.UUID(bytes=...) prints, so a
+  // bag's goal id can be compared against a client's log without reformatting.
+  static constexpr size_t kDashAfter[] = {4, 6, 8, 10};
+  std::ostringstream os;
+  os << std::hex << std::setfill('0');
+  for (size_t i = 0; i < uuid.size(); ++i) {
+    os << std::setw(2) << static_cast<unsigned>(uuid[i]);
+    for (size_t d : kDashAfter) {
+      if (i + 1 == d) {
+        os << '-';
+      }
+    }
+  }
+  return os.str();
+}
+
+void EpisodeRecorderNode::settle_goal(const std::shared_ptr<RecordEpisode::Result> & result)
+{
+  if (!goal_handle_) {
+    return;
+  }
+
+  // CANCELLED is in the abort set on purpose: it catches the case where the
+  // reason says cancelled but the goal never entered CANCELING, where
+  // succeeding would report a clean finish for work somebody asked to stop.
+  const std::string & r = result->termination_reason;
+  const bool abort_reason =
+    r == RecordEpisode::Result::TERMINATION_ERROR ||
+    r == RecordEpisode::Result::TERMINATION_NODE_DEACTIVATED ||
+    r == RecordEpisode::Result::TERMINATION_CANCELLED;
+
+  if (goal_handle_->is_canceling()) {
+    goal_handle_->canceled(result);
+  } else if (abort_reason) {
+    goal_handle_->abort(result);
+  } else {
+    goal_handle_->succeed(result);
+  }
+  goal_handle_.reset();
+}
+
+void EpisodeRecorderNode::finish_recording(
+  const std::string & termination_reason, const std::string & detail)
 {
   if (!is_recording_.exchange(false)) {
     return;
@@ -1060,7 +1170,7 @@ void EpisodeRecorderNode::finish_recording(const std::string & reason, bool canc
 
   std::string metadata_error;
   try {
-    write_metadata(current_bag_dir_, current_prompt_);
+    write_metadata(current_bag_dir_, current_prompt_, contract_text_, current_goal_id_);
   } catch (const std::exception & e) {
     metadata_error = e.what();
     RCLCPP_ERROR(get_logger(), "Metadata error: %s", metadata_error.c_str());
@@ -1092,36 +1202,34 @@ void EpisodeRecorderNode::finish_recording(const std::string & reason, bool canc
   // Settle the action goal, if this episode came from one.
   if (goal_handle_) {
     auto result = std::make_shared<RecordEpisode::Result>();
+    // bag_path is set on every path, including the failures: the bag exists and
+    // is worth looking at even when the episode did not end cleanly.
     result->bag_path = current_bag_dir_.string();
     result->messages_written = static_cast<int32_t>(written);
 
+    // Metadata failure outranks the reason the episode ended: the bag is on disk
+    // but is missing the prompt it is supposed to be identified by.
     if (!metadata_error.empty()) {
-      result->success = false;
+      result->termination_reason = RecordEpisode::Result::TERMINATION_ERROR;
       result->message = "Recording completed but metadata failed: " + metadata_error;
-      goal_handle_->abort(result);
-    } else if (canceled) {
-      result->success = false;
-      result->message = "Cancelled";
-      goal_handle_->canceled(result);
-    } else if (write_failed_.load()) {
-      result->success = false;
-      result->message = reason;
-      goal_handle_->abort(result);
     } else {
-      result->success = true;
-      result->message = "Recorded " + std::to_string(written) + " messages (" + reason + ")";
+      result->termination_reason = termination_reason;
+      result->message = detail;
       if (dropped) {
-        result->message += " (" + std::to_string(dropped) + " dropped: writer queue full)";
+        result->message += result->message.empty() ? "" : " ";
+        result->message += std::to_string(dropped) + " dropped: writer queue full";
       }
-      goal_handle_->succeed(result);
     }
-    goal_handle_.reset();
+    settle_goal(result);
   }
+  current_goal_id_.clear();
 }
 
-void EpisodeRecorderNode::write_metadata(const fs::path & bag_dir, const std::string & prompt)
+void EpisodeRecorderNode::write_metadata(
+  const fs::path & bag_dir, const std::string & prompt,
+  const std::string & contract_text, const std::string & goal_id)
 {
-  if (prompt.empty()) {
+  if (prompt.empty() && contract_text.empty() && goal_id.empty()) {
     return;
   }
 
@@ -1146,7 +1254,15 @@ void EpisodeRecorderNode::write_metadata(const fs::path & bag_dir, const std::st
       if (!info[kBagCustomDataKey] || !info[kBagCustomDataKey].IsMap()) {
         info[kBagCustomDataKey] = YAML::Node(YAML::NodeType::Map);
       }
-      info[kBagCustomDataKey][kBagPromptKey] = prompt;
+      if (!prompt.empty()) {
+        info[kBagCustomDataKey][kBagPromptKey] = prompt;
+      }
+      if (!contract_text.empty()) {
+        info[kBagCustomDataKey][kBagContractKey] = contract_text;
+      }
+      if (!goal_id.empty()) {
+        info[kBagCustomDataKey][kBagGoalIdKey] = goal_id;
+      }
 
       std::ofstream out(meta_path);
       if (!out) {
@@ -1208,14 +1324,18 @@ void EpisodeRecorderNode::handle_accepted(std::shared_ptr<GoalHandle> handle)
   goal_handle_ = handle;
 
   std::string error;
-  if (!start_recording(handle->get_goal()->prompt, error)) {
+  const auto goal = handle->get_goal();
+  if (start_recording(goal->prompt, goal->max_duration_s, error)) {
+    // Stamped into the bag so a recording can be traced back to the goal that
+    // asked for it. Set after the start succeeds: a rejected start writes no bag.
+    current_goal_id_ = format_goal_id(handle->get_goal_id());
+  } else {
     auto result = std::make_shared<RecordEpisode::Result>();
-    result->success = false;
+    result->termination_reason = RecordEpisode::Result::TERMINATION_ERROR;
     result->message = error;
     result->bag_path = "";
     result->messages_written = 0;
-    handle->abort(result);
-    goal_handle_.reset();
+    settle_goal(result);
   }
 }
 
@@ -1231,7 +1351,8 @@ void EpisodeRecorderNode::on_start_service(
   // No action goal for service-based recording; goal_handle_ stays null and the
   // timer simply skips feedback.
   goal_handle_.reset();
-  if (start_recording(req->prompt, error)) {
+  current_goal_id_.clear();
+  if (start_recording(req->prompt, 0.0, error)) {
     res->accepted = true;
     res->message = "Recording started";
   } else {

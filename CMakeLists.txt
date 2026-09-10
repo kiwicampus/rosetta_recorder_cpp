@@ -83,12 +83,20 @@ target_compile_features(episode_recorder_node PUBLIC cxx_std_17)
 target_link_libraries(episode_recorder_node rosetta_recorder_core)
 ament_target_dependencies(episode_recorder_node rclcpp)
 
+# Same main, no lifecycle manager needed: hides the lifecycle services and
+# configures and activates itself at startup.
+add_executable(episode_recorder_node_no_lifecycle src/main.cpp)
+target_compile_features(episode_recorder_node_no_lifecycle PUBLIC cxx_std_17)
+target_compile_definitions(episode_recorder_node_no_lifecycle PRIVATE ROSETTA_RECORDER_NO_LIFECYCLE=1)
+target_link_libraries(episode_recorder_node_no_lifecycle rosetta_recorder_core)
+ament_target_dependencies(episode_recorder_node_no_lifecycle rclcpp)
+
 install(TARGETS rosetta_recorder_core
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
-install(TARGETS episode_recorder_node
+install(TARGETS episode_recorder_node episode_recorder_node_no_lifecycle
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/

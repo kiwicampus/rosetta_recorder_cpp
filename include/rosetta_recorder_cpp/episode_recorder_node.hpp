@@ -107,7 +107,15 @@ public:
   using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface
     ::CallbackReturn;
 
-  explicit EpisodeRecorderNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+  /// \param lifecycle Forwarded to LifecycleNode as enable_communication_interface.
+  ///   True creates the ~/change_state, ~/get_state, ~/get_available_states,
+  ///   ~/get_available_transitions and ~/get_transition_graph services plus the
+  ///   ~/transition_event publisher, so a manager can drive the node. False
+  ///   creates none of them: the node looks like a plain node on the graph, the
+  ///   state machine still runs in process, and the caller drives configure()
+  ///   and activate() itself.
+  explicit EpisodeRecorderNode(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions(), bool lifecycle = true);
   ~EpisodeRecorderNode() override;
 
   // -------------------- Lifecycle --------------------

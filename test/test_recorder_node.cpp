@@ -148,7 +148,7 @@ protected:
   }
 
   /// Build the recorder. Extra overrides let a test change one parameter.
-  void make_node(const std::vector<rclcpp::Parameter> & extra = {})
+  void make_node(const std::vector<rclcpp::Parameter> & extra = {}, bool lifecycle = true)
   {
     rclcpp::NodeOptions opts;
     std::vector<rclcpp::Parameter> params{
@@ -163,7 +163,7 @@ protected:
       params.push_back(p);
     }
     opts.parameter_overrides(params);
-    node_ = std::make_shared<EpisodeRecorderNode>(opts);
+    node_ = std::make_shared<EpisodeRecorderNode>(opts, lifecycle);
   }
 
   /// A second node for clients and publishers, so nothing under test is
@@ -1074,4 +1074,30 @@ TEST_F(RecorderNodeTest, IncludeTopicsOverridesExcludeTopics)
     };
   EXPECT_TRUE(has("/probe_keep")) << "include_topics did not override exclude_topics";
   EXPECT_FALSE(has("/probe_drop")) << "exclude_topics stopped applying";
+}
+
+// ---------------------------------------------------------------------------
+// Plain mode: no lifecycle services, same transitions driven inline
+// ---------------------------------------------------------------------------
+
+TEST_F(RecorderNodeTest, PlainModeHidesLifecycleServicesAndRecords)
+{
+  make_node({}, false);
+  configure_and_activate();
+  EXPECT_EQ(node_->count_subscribers("/test_erc/a"), 1u);
+  make_helper();
+  start_spin();
+
+  const auto services = helper_->get_service_names_and_types();
+  EXPECT_EQ(services.count("/episode_recorder/change_state"), 0u);
+  EXPECT_EQ(services.count("/episode_recorder/get_state"), 0u);
+
+  auto started = call<StartRecording>(
+    "/episode_recorder/start_recording", std::make_shared<StartRecording::Request>());
+  ASSERT_NE(started, nullptr);
+  EXPECT_TRUE(started->accepted) << started->message;
+  auto stopped = call<Trigger>(
+    "/episode_recorder/cancel_recording", std::make_shared<Trigger::Request>());
+  ASSERT_NE(stopped, nullptr);
+  EXPECT_TRUE(stopped->success) << stopped->message;
 }

@@ -74,8 +74,8 @@ void set_bag_timestamp(rosbag2_storage::SerializedBagMessage & msg, int64_t time
 
 }  // namespace
 
-EpisodeRecorderNode::EpisodeRecorderNode(const rclcpp::NodeOptions & options)
-: rclcpp_lifecycle::LifecycleNode("episode_recorder", options)
+EpisodeRecorderNode::EpisodeRecorderNode(const rclcpp::NodeOptions & options, bool lifecycle)
+: rclcpp_lifecycle::LifecycleNode("episode_recorder", options, lifecycle)
 {
   declare_parameters();
   RCLCPP_INFO(get_logger(), "Node created (unconfigured)");

@@ -114,8 +114,10 @@ ros2 launch rosetta_recorder_cpp rosetta_recorder_cpp.launch.py \
   bag_base_dir:=/path/to/bags
 ```
 
-The launch file brings the node up and drives it configure → activate. To run it
-by hand:
+The launch file brings the node up and drives it configure → activate. A second
+executable, `episode_recorder_node_no_lifecycle`, needs no manager: it creates
+no lifecycle services, activates itself at startup, and exits nonzero when that
+fails. To run the lifecycle one by hand:
 
 ```bash
 ros2 run rosetta_recorder_cpp episode_recorder_node --ros-args \

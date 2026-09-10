@@ -19,15 +19,37 @@
 #include <cstdio>
 #include <memory>
 
+#include "lifecycle_msgs/msg/state.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 #include "rosetta_recorder_cpp/episode_recorder_node.hpp"
+
+// Built twice: episode_recorder_node waits for a lifecycle manager, and
+// episode_recorder_node_no_lifecycle hides the lifecycle services and drives
+// itself to active. The launch file picks the executable.
+#ifdef ROSETTA_RECORDER_NO_LIFECYCLE
+constexpr bool kLifecycle = false;
+#else
+constexpr bool kLifecycle = true;
+#endif
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
 
-  auto node = std::make_shared<rosetta_recorder_cpp::EpisodeRecorderNode>();
+  auto node = std::make_shared<rosetta_recorder_cpp::EpisodeRecorderNode>(
+    rclcpp::NodeOptions(), kLifecycle);
+
+  // A failed startup exits nonzero so a launch respawn can retry instead of
+  // leaving a dead process behind.
+  if (!kLifecycle &&
+    (node->configure().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE ||
+    node->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE))
+  {
+    std::fprintf(stderr, "episode_recorder_node: startup transition failed\n");
+    rclcpp::shutdown();
+    return 1;
+  }
 
   // A single executor thread is both cheaper and sufficient: nothing in this
   // node blocks it. Disk writes live on the writer thread, and the action goal
